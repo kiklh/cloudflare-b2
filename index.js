@@ -6,15 +6,9 @@
 import { AwsClient } from 'aws4fetch'
 
 const UNSIGNABLE_HEADERS = [
-    // These headers appear in the request, but are never passed upstream
     'x-forwarded-proto',
     'x-real-ip',
-    // We can't include accept-encoding in the signature because Cloudflare
-    // sets the incoming accept-encoding header to "gzip, br", then modifies
-    // the outgoing request to set accept-encoding to "gzip".
-    // Not cool, Cloudflare!
     'accept-encoding',
-    // Conditional headers are not consistently passed upstream
     'if-match',
     'if-modified-since',
     'if-none-match',
@@ -22,17 +16,87 @@ const UNSIGNABLE_HEADERS = [
     'if-unmodified-since',
 ];
 
-// URL needs colon suffix on protocol, and port as a string
 const HTTPS_PROTOCOL = "https:";
 const HTTPS_PORT = "443";
 
-// How many times to retry a range request where the response is missing content-range
 const RANGE_RETRY_ATTEMPTS = 3;
 
-// Filter out cf-* and any other headers we don't want to include in the signature
+// 根据文件扩展名推断 Content-Type 的映射表
+const MIME_TYPES = {
+    // 图片
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    svg: 'image/svg+xml',
+    bmp: 'image/bmp',
+    ico: 'image/x-icon',
+    // 视频
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    ogg: 'video/ogg',
+    ogv: 'video/ogg',
+    mov: 'video/quicktime',
+    m3u8: 'application/vnd.apple.mpegurl',
+    ts: 'video/mp2t',
+    // 音频
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    flac: 'audio/flac',
+    m4a: 'audio/mp4',
+    // 文档与其他
+    pdf: 'application/pdf',
+    txt: 'text/plain',
+    html: 'text/html',
+    htm: 'text/html',
+    css: 'text/css',
+    js: 'application/javascript',
+    json: 'application/json',
+    xml: 'application/xml',
+    zip: 'application/zip',
+};
+
+// 从路径中提取扩展名并返回对应的 MIME 类型
+function inferContentType(path) {
+    const lastSegment = path.split('/').pop() || '';
+    const dotIndex = lastSegment.lastIndexOf('.');
+    if (dotIndex === -1) return null;
+    const ext = lastSegment.slice(dotIndex + 1).toLowerCase();
+    return MIME_TYPES[ext] || null;
+}
+
+// 如果响应缺少 Content-Type 或返回了通用的二进制类型，则根据文件扩展名覆盖它
+function applyContentType(response, path) {
+    const inferred = inferContentType(path);
+    if (!inferred) return response;
+
+    const currentType = response.headers.get('content-type') || '';
+    // 只在缺失或为 octet-stream 时覆盖，保留 B2 已设置的正确类型
+    if (currentType && !currentType.includes('octet-stream')) {
+        return response;
+    }
+
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set('Content-Type', inferred);
+
+    // HEAD 响应没有 body，用 null 构造
+    if (!response.body) {
+        return new Response(null, {
+            headers: newHeaders,
+            status: response.status,
+            statusText: response.statusText,
+        });
+    }
+
+    return new Response(response.body, {
+        headers: newHeaders,
+        status: response.status,
+        statusText: response.statusText,
+    });
+}
+
 function filterHeaders(headers, env) {
-    // Suppress irrelevant IntelliJ warning
-    // noinspection JSCheckFunctionSignatures
     return new Headers(Array.from(headers.entries())
         .filter(pair => !(
             UNSIGNABLE_HEADERS.includes(pair[0])
@@ -53,16 +117,13 @@ function createHeadResponse(response) {
 function isListBucketRequest(env, path) {
     const pathSegments = path.split('/');
 
-    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2) // https://endpoint/bucket-name/
-        || (env['BUCKET_NAME'] !== "$path" && path.length === 0); // https://bucket-name.endpoint/ or https://endpoint/
+    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2)
+        || (env['BUCKET_NAME'] !== "$path" && path.length === 0);
 }
 
-// Supress IntelliJ's "unused default export" warning
-// noinspection JSUnusedGlobalSymbols
 export default {
     async fetch(request, env) {
-        // Only allow GET and HEAD methods
-        if (!['GET', 'HEAD'].includes(request.method)){
+        if (!['GET', 'HEAD'].includes(request.method)) {
             return new Response(null, {
                 status: 405,
                 statusText: "Method Not Allowed"
@@ -71,18 +132,12 @@ export default {
 
         const url = new URL(request.url);
 
-        // Incoming protocol and port is taken from the worker's environment.
-        // Local dev mode uses plain http on 8787, and it's possible to deploy
-        // a worker on plain http. B2 only supports https on 443
         url.protocol = HTTPS_PROTOCOL;
         url.port = HTTPS_PORT;
 
-        // Remove leading slashes from path
         let path = url.pathname.replace(/^\//, '');
-        // Remove trailing slashes
         path = path.replace(/\/$/, '');
 
-        // Reject list bucket requests unless configuration allows it
         if (isListBucketRequest(env, path) && String(env['ALLOW_LIST_BUCKET']) !== "true") {
             return new Response(null, {
                 status: 404,
@@ -90,65 +145,46 @@ export default {
             });
         }
 
-        // Set RCLONE_DOWNLOAD to "true" to use rclone with --b2-download-url
-        // See https://rclone.org/b2/#b2-download-url
         const rcloneDownload = String(env["RCLONE_DOWNLOAD"]) === 'true';
 
-        // Set upstream target hostname.
         switch (env['BUCKET_NAME']) {
             case "$path":
-                // Bucket name is initial segment of URL path
                 url.hostname = env['B2_ENDPOINT'];
                 break;
             case "$host":
-                // Bucket name is initial subdomain of the incoming hostname
                 url.hostname = url.hostname.split('.')[0] + '.' + env['B2_ENDPOINT'];
                 break;
             default:
-                // Bucket name is specified in the BUCKET_NAME variable
                 url.hostname = env['BUCKET_NAME'] + "." + env['B2_ENDPOINT'];
                 break;
         }
 
-        // Certain headers, such as x-real-ip, appear in the incoming request but
-        // are removed from the outgoing request. If they are in the outgoing
-        // signed headers, B2 can't validate the signature.
         const headers = filterHeaders(request.headers, env);
 
-        // Create an S3 API client that can sign the outgoing request
         const client = new AwsClient({
             "accessKeyId": env['B2_APPLICATION_KEY_ID'],
             "secretAccessKey": env['B2_APPLICATION_KEY'],
             "service": "s3",
         });
 
-        // Save the request method, so we can process responses for HEAD requests appropriately
         const requestMethod = request.method;
 
         if (rcloneDownload) {
             if (env['BUCKET_NAME'] === "$path") {
-                // Remove leading file/ prefix from the path
                 url.pathname = path.replace(/^file\//, "");
             } else {
-                // Remove leading file/{bucket_name}/ prefix from the path 
                 url.pathname = path.replace(/^file\/[^/]+\//, "");
-            }            
+            }
         }
 
-        // Sign the outgoing request
-        //
-        // For HEAD requests Cloudflare appears to change the method on the outgoing request to GET (#18), which
-        // breaks the signature, resulting in a 403. So, change all HEADs to GETs. This is not too inefficient,
-        // since we won't read the body of the response if the original request was a HEAD.
         const signedRequest = await client.sign(url.toString(), {
             method: 'GET',
             headers: headers
         });
 
-        // For large files, Cloudflare will return the entire file, rather than the requested range
-        // So, if there is a range header in the request, check that the response contains the
-        // content-range header. If not, abort the request and try again.
-        // See https://community.cloudflare.com/t/cloudflare-worker-fetch-ignores-byte-request-range-on-initial-request/395047/4
+        // 用于推断 Content-Type 的路径（rclone 前缀已去除）
+        const contentTypePath = url.pathname.replace(/^\//, '');
+
         if (signedRequest.headers.has("range")) {
             let attempts = RANGE_RETRY_ATTEMPTS;
             let response;
@@ -160,21 +196,17 @@ export default {
                     signal: controller.signal,
                 });
                 if (response.headers.has("content-range")) {
-                    // Only log if it didn't work first time
                     if (attempts < RANGE_RETRY_ATTEMPTS) {
                         console.log(`Retry for ${signedRequest.url} succeeded - response has content-range header`);
                     }
-                    // Break out of loop and return the response
                     break;
                 } else if (response.ok) {
                     attempts -= 1;
                     console.error(`Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`);
-                    // Do not abort on the last attempt, as we want to return the response
                     if (attempts > 0) {
                         controller.abort();
                     }
                 } else {
-                    // Response is not ok, so don't retry
                     break;
                 }
             } while (attempts > 0);
@@ -184,25 +216,24 @@ export default {
             }
 
             if (requestMethod === 'HEAD') {
-                // Original request was HEAD, so return a new Response without a body
-                return createHeadResponse(response);
+                // HEAD 请求，返回无 body 的响应，同时修正 Content-Type
+                return applyContentType(createHeadResponse(response), contentTypePath);
             }
 
-            // Return whatever response we have rather than an error response
-            // This response cannot be aborted, otherwise it will raise an exception
-            return response;
+            // Range 请求的响应同样应用 Content-Type
+            return applyContentType(response, contentTypePath);
         }
 
-        // Send the signed request to B2
         const fetchPromise = fetch(signedRequest);
 
         if (requestMethod === 'HEAD') {
             const response = await fetchPromise;
-            // Original request was HEAD, so return a new Response without a body
-            return createHeadResponse(response);
+            // HEAD 请求，返回无 body 的响应，同时修正 Content-Type
+            return applyContentType(createHeadResponse(response), contentTypePath);
         }
 
-        // Return the upstream response unchanged
-        return fetchPromise;
+        // 普通 GET 请求，返回带修正 Content-Type 的响应
+        const response = await fetchPromise;
+        return applyContentType(response, contentTypePath);
     },
 };

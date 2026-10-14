@@ -19,5 +19,9 @@
   },
   "dependencies": {
     "aws4fetch": "^1.0.20"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260811.1": true
   }
 }
